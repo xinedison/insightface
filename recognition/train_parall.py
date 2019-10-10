@@ -63,6 +63,7 @@ def parse_args():
   parser.add_argument('--kvstore', type=str, default=default.kvstore, help='kvstore setting')
   parser.add_argument('--worker-id', type=int, default=0, help='worker id for dist training, starts from 0')
   parser.add_argument('--extra-model-name', type=str, default='', help='extra model name')
+
   args = parser.parse_args()
   return args
 
@@ -86,6 +87,7 @@ def get_symbol_arcface(args):
       lr_mult=config.fc7_lr_mult, wd_mult=config.fc7_wd_mult)
   if config.loss_name=='softmax': #softmax
     fc7 = mx.sym.FullyConnected(data=embedding, weight = _weight, no_bias = True, num_hidden=args.ctx_num_classes, name='fc7_%d'%args._ctxid)
+    assert False
   elif config.loss_name=='margin_softmax':
     _weight = mx.symbol.L2Normalization(_weight, mode='instance')
     nembedding = mx.symbol.L2Normalization(embedding, mode='instance', name='fc1n_%d'%args._ctxid)
@@ -115,6 +117,7 @@ def get_symbol_arcface(args):
   out_list = []
   out_list.append(fc7)
   if config.loss_name=='softmax': #softmax
+    assert False
     out_list.append(gt_label)
   out = mx.symbol.Group(out_list)
   return out
@@ -134,14 +137,23 @@ def train_net(args):
       print('use cpu')
     else:
       print('gpu num:', len(ctx))
+
     if len(args.extra_model_name)==0:
       prefix = os.path.join(args.models_root, '%s-%s-%s'%(args.network, args.loss, args.dataset), 'model')
     else:
       prefix = os.path.join(args.models_root, '%s-%s-%s-%s'%(args.network, args.loss, args.dataset, args.extra_model_name), 'model')
+
     prefix_dir = os.path.dirname(prefix)
     print('prefix', prefix)
     if not os.path.exists(prefix_dir):
       os.makedirs(prefix_dir)
+
+    
+    filehandler = logging.FileHandler("{}.log".format(prefix))
+    streamhandler = logging.StreamHandler()
+    logger.addHandler(filehandler)
+    logger.addHandler(streamhandler)
+
     args.ctx_num = len(ctx)
     if args.per_batch_size==0:
       args.per_batch_size = 128
@@ -181,6 +193,7 @@ def train_net(args):
     #args.partial_start = local_classes_range[0]
 
     print('Called with argument:', args, config)
+    logger.info("Train model with argument:", args, config)
     mean = None
 
     begin_epoch = 0
@@ -201,6 +214,7 @@ def train_net(args):
       FLOPs = flops_counter.count_flops(_sym, data=(1,3,image_size[0],image_size[1]))
       _str = flops_counter.flops_str(FLOPs)
       print('Network FLOPs: %s'%_str)
+      logging.info("Network FLOPs : %s" % _str)
 
     if config.num_workers==1:
       from parall_module_local_v1 import ParallModule
@@ -214,6 +228,7 @@ def train_net(args):
         label_names    = ['softmax_label'],
         asymbol       = asym,
         args = args,
+        logger=logger,
     )
     val_dataiter = None
     train_dataiter = FaceImageIter(
@@ -251,6 +266,7 @@ def train_net(args):
         print('ver', name)
 
 
+
     def ver_test(nbatch):
       results = []
       for i in range(len(ver_list)):
@@ -277,11 +293,14 @@ def train_net(args):
         if mbatch==step:
           opt.lr *= 0.1
           print('lr change to', opt.lr)
+          logger.info('lr change to', opt.lr)
+
           break
 
       _cb(param)
       if mbatch%1000==0:
         print('lr-batch-epoch:',opt.lr,param.nbatch,param.epoch)
+        logger.info('lr-batch-epoch:',opt.lr,param.nbatch,param.epoch)
 
       if mbatch>=0 and mbatch%args.verbose==0:
         acc_list = ver_test(mbatch)
@@ -317,11 +336,15 @@ def train_net(args):
 
         if do_save:
           print('saving', msave)
+          logger.info('saving', msave)
+
           arg, aux = model.get_export_params()
           all_layers = model.symbol.get_internals()
           _sym = all_layers['fc1_output']
           mx.model.save_checkpoint(prefix, msave, _sym, arg, aux)
         print('[%d]Accuracy-Highest: %1.5f'%(mbatch, highest_acc[-1]))
+        logger.info('[%d]Accuracy-Highest: %1.5f'%(mbatch, highest_acc[-1]))
+
       if config.max_steps>0 and mbatch>config.max_steps:
         sys.exit(0)
 

@@ -157,6 +157,8 @@ class ParallModule(BaseModule):
     def bind(self, data_shapes, label_shapes=None, for_training=True,
              inputs_need_grad=False, force_rebind=False, shared_module=None):
         print('in_bind', self.params_initialized, data_shapes, label_shapes)
+        self.logger.info('in_bind', self.params_initialized, data_shapes, label_shapes)
+
         if self.params_initialized:
             arg_params, aux_params = self.get_params()
 
@@ -177,6 +179,8 @@ class ParallModule(BaseModule):
                     force_rebind=False, shared_module=None)
         _data_shape = data_shapes[0][1]
         print('_data_shape', _data_shape, label_shapes)
+        self.logger.info('_data_shape', _data_shape, label_shapes)
+
         for _module in self._arcface_modules:
           _module.bind([('data', (_data_shape[0]*self._num_workers, self._emb_size))], [('softmax_label', (_data_shape[0]*self._num_workers,))], for_training, True,
                       force_rebind=False, shared_module=None)
@@ -291,6 +295,8 @@ class ParallModule(BaseModule):
           #local_label = self.get_ndarray2(_ctx, 'test_label', local_label)
           _pred = nd.equal(fc7_pred, local_label)
           print('{fc7_acc}', self._iter, nd.mean(_pred).asnumpy()[0])
+          self.logger.info('{fc7_acc}', self._iter, nd.mean(_pred).asnumpy()[0])
+
 
 
         #local_fc1_grad = []
