@@ -12,8 +12,6 @@ import sys
 import math
 import random
 import logging
-import pickle
-import sklearn
 import numpy as np
 from image_iter import FaceImageIter
 import mxnet as mx
@@ -193,7 +191,7 @@ def train_net(args):
     #args.partial_start = local_classes_range[0]
 
     print('Called with argument:', args, config)
-    logger.info("Train model with argument:", args, config)
+    logger.info("Train model with argument: {}".format(args, config))
     mean = None
 
     begin_epoch = 0
@@ -300,7 +298,7 @@ def train_net(args):
       _cb(param)
       if mbatch%1000==0:
         print('lr-batch-epoch:',opt.lr,param.nbatch,param.epoch)
-        logger.info('lr-batch-epoch:',opt.lr,param.nbatch,param.epoch)
+        logger.info('lr-batch-epoch: {}'.format(opt.lr,param.nbatch,param.epoch))
 
       if mbatch>=0 and mbatch%args.verbose==0:
         acc_list = ver_test(mbatch)
@@ -336,7 +334,7 @@ def train_net(args):
 
         if do_save:
           print('saving', msave)
-          logger.info('saving', msave)
+          logger.info('saving {}'.format(msave))
 
           arg, aux = model.get_export_params()
           all_layers = model.symbol.get_internals()

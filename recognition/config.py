@@ -108,10 +108,18 @@ dataset = edict()
 
 dataset.emore = edict()
 dataset.emore.dataset = 'emore'
-dataset.emore.dataset_path = '/data4/face_datasets/faces_ms1m_112x112'
+dataset.emore.dataset_path = '/data1/face_datasets/faces_ms1m_112x112'
 dataset.emore.num_classes = 85742
 dataset.emore.image_shape = (112,112,3)
 dataset.emore.val_targets = ['lfw', 'cfp_fp', 'agedb_30']
+
+dataset.train_1m = edict()
+dataset.train_1m.dataset = 'train_1m'
+dataset.train_1m.dataset_path = '/data4/face_datasets/faces_umd'
+dataset.train_1m.num_classes = 1000000
+dataset.train_1m.image_shape = (112,112,3)
+dataset.train_1m.val_targets = ['lfw', 'cfp_fp', 'agedb_30']
+
 
 dataset.retina = edict()
 dataset.retina.dataset = 'retina'
@@ -181,7 +189,7 @@ default.pretrained_epoch = 1
 default.dataset = 'emore'
 default.loss = 'arcface'
 default.frequent = 20
-default.verbose = 2000
+default.verbose = 100
 default.kvstore = 'device'
 
 default.end_epoch = 10000

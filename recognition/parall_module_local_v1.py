@@ -57,7 +57,7 @@ class ParallModule(BaseModule):
 
           args._ctxid = i
           _module = Module(self._asymbol(args), self._data_names, self._label_names, logger=self.logger,
-                          context=mx.gpu(i), work_load_list=self._work_load_list,
+                          context=self._context[i], work_load_list=self._work_load_list,
                           fixed_param_names=self._fixed_param_names)
           self._arcface_modules.append(_module)
           _c = args.local_class_start + i*args.ctx_num_classes
@@ -157,7 +157,7 @@ class ParallModule(BaseModule):
     def bind(self, data_shapes, label_shapes=None, for_training=True,
              inputs_need_grad=False, force_rebind=False, shared_module=None):
         print('in_bind', self.params_initialized, data_shapes, label_shapes)
-        self.logger.info('in_bind', self.params_initialized, data_shapes, label_shapes)
+        self.logger.info('in_bind {}'.format(self.params_initialized, data_shapes, label_shapes))
 
         if self.params_initialized:
             arg_params, aux_params = self.get_params()
@@ -179,7 +179,7 @@ class ParallModule(BaseModule):
                     force_rebind=False, shared_module=None)
         _data_shape = data_shapes[0][1]
         print('_data_shape', _data_shape, label_shapes)
-        self.logger.info('_data_shape', _data_shape, label_shapes)
+        self.logger.info('_data_shape {}'.format( _data_shape, label_shapes))
 
         for _module in self._arcface_modules:
           _module.bind([('data', (_data_shape[0]*self._num_workers, self._emb_size))], [('softmax_label', (_data_shape[0]*self._num_workers,))], for_training, True,
@@ -243,7 +243,7 @@ class ParallModule(BaseModule):
       return v
 
     def get_ndarray2(self, context, name, arr):
-      key = "%s_%s"%(name, context)
+      key = "%s_%s" % (name, context)
       #print(key)
       if not key in self._nd_cache:
         v = nd.zeros( shape=arr.shape, ctx = context)
@@ -281,21 +281,21 @@ class ParallModule(BaseModule):
           local_fc7_sum += _sum
         global_fc7_sum = local_fc7_sum
 
-        if self._iter%self._verbose==0:
+        if self._iter % self._verbose == 0:
           #_ctx = self._context[-1]
           _ctx = self._ctx_cpu
           _probs = []
           for i, _module in enumerate(self._arcface_modules):
-            _prob = self.get_ndarray2(_ctx, '_fc7_prob_%d'%i, fc7_outs[i])
+            _prob = self.get_ndarray2(_ctx, '_fc7_prob_%d' % i, fc7_outs[i])
             _probs.append(_prob)
           fc7_prob = self.get_ndarray(_ctx, 'test_fc7_prob', (self._batch_size, self._ctx_num_classes*len(self._context)))
           nd.concat(*_probs, dim=1, out=fc7_prob)
           fc7_pred = nd.argmax(fc7_prob, axis=1)
           local_label = self.global_label - self._local_class_start
           #local_label = self.get_ndarray2(_ctx, 'test_label', local_label)
-          _pred = nd.equal(fc7_pred, local_label)
-          print('{fc7_acc}', self._iter, nd.mean(_pred).asnumpy()[0])
-          self.logger.info('{fc7_acc}', self._iter, nd.mean(_pred).asnumpy()[0])
+          _pred = nd.equal(fc7_pred, local_label).asnumpy()[0]
+          print('{fc7_acc}', self._iter, np.mean(_pred))
+          self.logger.info('iter {} acc : {}'.format(self._iter, np.mean(_pred)))
 
 
 
@@ -343,10 +343,7 @@ class ParallModule(BaseModule):
 
     def update_metric(self, eval_metric, labels):
         assert self.binded and self.params_initialized
-        #self._curr_module.update_metric(eval_metric, labels)
-        #label = labels[0]
-        #print(label.shape)
-        #self._arcface_module.update_metric(eval_metric, labels)
+        
 
     def install_monitor(self, mon):
         """ Install monitor on all executors """
@@ -460,7 +457,7 @@ class ParallModule(BaseModule):
             validation_metric = eval_metric
         if not isinstance(eval_metric, metric.EvalMetric):
             eval_metric = metric.create(eval_metric)
-        epoch_eval_metric = copy.deepcopy(eval_metric)
+        #epoch_eval_metric = copy.deepcopy(eval_metric)
 
         ################################################################################
         # training loop
@@ -468,7 +465,7 @@ class ParallModule(BaseModule):
         for epoch in range(begin_epoch, num_epoch):
             tic = time.time()
             eval_metric.reset()
-            epoch_eval_metric.reset()
+            #epoch_eval_metric.reset()
             nbatch = 0
             data_iter = iter(train_data)
             end_of_batch = False
@@ -486,13 +483,9 @@ class ParallModule(BaseModule):
                 #    self.update_metric(eval_metric,
                 #                       [db.label for db in data_batch],
                 #                       pre_sliced=True)
-                #    self.update_metric(epoch_eval_metric,
-                #                       [db.label for db in data_batch],
-                #                       pre_sliced=True)
                 #else:
                 #    #print('before update metric')
                 #    self.update_metric(eval_metric, data_batch.label)
-                #    self.update_metric(epoch_eval_metric, data_batch.label)
                 #labels = data_batch.label
                 #labels = [self.global_label]
                 #self.update_metric(eval_metric, labels)
