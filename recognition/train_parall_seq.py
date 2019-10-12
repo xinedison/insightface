@@ -52,6 +52,8 @@ def parse_args():
     parser.add_argument('--kvstore', type=str, default=default.kvstore, help='kvstore setting')
     parser.add_argument('--worker-id', type=int, default=0, help='worker id for dist training, starts from 0')
     parser.add_argument('--extra-model-name', type=str, default='', help='extra model name')
+    parser.add_argument('--gpu-num4cls', type=int, default=0, help='gpu used by only fc weight')
+
   
     args = parser.parse_args()
     return args
@@ -72,14 +74,13 @@ def get_data_iter(config, batch_size):
 
     val_dataiter = None
 
-    mean = None
     train_dataiter = FaceImageIter(
         batch_size           = batch_size,
         data_shape           = data_shape,
         path_imgrec          = path_imgrec,
         shuffle              = True,
         rand_mirror          = config.data_rand_mirror,
-        mean                 = mean,
+        mean                 = None,
         cutoff               = config.data_cutoff,
         color_jittering      = config.data_color,
         images_filter        = config.data_images_filter,
@@ -120,19 +121,30 @@ def train_net(args):
     logger.addHandler(streamhandler)
 
     ## ================ parse batch size and class info ======================
-    args.ctx_num = len(ctx_list)
+    if args.gpu_num4cls > 0: # model weight split num
+        global_num_ctx4cls = args.gpu_num4cls
+        args.backbone_ctx_num = len(ctx_list) - args.gpu_num4cls
+        assert args.backbone_ctx_num > 1
+        ctx_list4backbone = ctx_list[:args.backbone_ctx_num]
+        ctx_list4cls = ctx_list[-1*args.gpu_num4cls:]
+    else: 
+        args.backbone_ctx_num = len(ctx_list)
+        global_num_ctx4cls = config.num_workers * args.backbone_ctx_num
+        ctx_list4backbone = ctx_list
+        ctx_list4cls = ctx_list
+
     if args.per_batch_size==0:
         args.per_batch_size = 128
-    args.batch_size = args.per_batch_size*args.ctx_num
-    
-    global_num_ctx = config.num_workers * args.ctx_num
-    if config.num_classes % global_num_ctx == 0:
-        args.ctx_num_classes = config.num_classes//global_num_ctx
-    else:
-        args.ctx_num_classes = config.num_classes//global_num_ctx+1
 
-    args.local_num_classes = args.ctx_num_classes * args.ctx_num
-    args.local_class_start = args.local_num_classes * args.worker_id
+    args.batch_size = args.per_batch_size*args.backbone_ctx_num
+
+    
+    if config.num_classes % global_num_ctx4cls == 0:
+        args.ctx_num_classes = config.num_classes//global_num_ctx4cls
+    else:
+        args.ctx_num_classes = config.num_classes//global_num_ctx4cls+1
+
+    args.local_class_start = 0
 
     logger.info("Train model with argument: {}".format(args, config))
 
@@ -158,13 +170,13 @@ def train_net(args):
 
     if config.num_workers == 1:
         from parall_loss_module import ParallLossModule
-        default_ctx = ctx_list[-1]
+        default_ctx = ctx_list4cls[-1]
         model_parall_loss = ParallLossModule(
                 context=default_ctx, batch_size=args.batch_size, 
                 ctx_num_class=args.ctx_num_classes, 
                 local_class_start=args.local_class_start, logger=logger)
 
-        for i, ctx in enumerate(ctx_list):
+        for i, ctx in enumerate(ctx_list4cls):
             args._ctxid = i
             part_w_sym = asym(args)
             part_weight_module = mx.mod.Module(part_w_sym, context=ctx)
@@ -176,7 +188,7 @@ def train_net(args):
 
     model = mx.mod.SequentialModule()
     embedding_feat_mod = mx.mod.Module(esym, 
-                            context=ctx_list, label_names=None)
+                            context=ctx_list4backbone, label_names=None)
     model.add(embedding_feat_mod)
     model.add(model_parall_loss, auto_wiring=True, take_labels=True)
 
