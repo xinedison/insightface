@@ -6,10 +6,28 @@
 
 import logging
 import copy
+import math
 
+import mxnet as mx
 from mxnet.initializer import Uniform
 
 from mxnet.module.base_module import BaseModule
+
+def parall_loss(device_preds, device_labels, ctx, batch_size):
+    with mx.autograd.record():
+        max_list = [mx.nd.max(pred, axis=1, keepdims=True).copyto(ctx)
+                    for pred in device_preds]
+        maxmium = mx.nd.max(mx.nd.concat(*max_list, dim=1), axis=1, keepdims=True)
+        z_list = [pred - maxmium.copyto(pred.context) for pred in device_preds]
+        sum_list = [mx.nd.sum(mx.nd.exp(z), axis=1, keepdims=True).copyto(ctx) for z in z_list]
+        log_sum = mx.nd.log(mx.nd.add_n(*sum_list))
+
+        log_softmax_list = [z - log_sum.copyto(z.context) for z in z_list]
+
+        loss_list = [mx.nd.sum(-log_softmax * label) 
+                for log_softmax, label in zip(log_softmax_list, device_labels)]
+        total_loss = mx.nd.add_n(*[loss.copyto(ctx) for loss in loss_list])/batch_size
+        return total_loss
 
 class ParallLossModule(BaseModule):
     """A SequentialModule is a container module that can chain multiple modules together.
@@ -24,21 +42,29 @@ class ParallLossModule(BaseModule):
     META_TAKE_LABELS = 'take_labels'
     META_AUTO_WIRING = 'auto_wiring'
 
-    def __init__(self, logger=logging):
+    def __init__(self, context, batch_size, ctx_num_class, 
+                 local_class_start, logger=logging):
         super(ParallLossModule, self).__init__(logger=logger)
         self._modules = []
-        self._metas = []
+        self._sub_module_contexts = []
+        self._context = context
+        self._batch_size = batch_size
+        self._ctx_num_class = ctx_num_class
+        self.local_class_start = local_class_start
+        assert local_class_start == 0
 
         self._label_shapes = None
         self._data_shapes = None
 
-    def add(self, module, ctx, **kwargs):
+    def add(self, module, context, **kwargs):
         """Add a module to the the container
 
         Parameters
         ----------
         module : BaseModule
             The new module to add.
+        context : Context
+            The context the module is run in
         kwargs : ``**keywords``
             All the keyword arguments are saved as meta information
             for the added module. The currently known meta includes
@@ -63,8 +89,8 @@ class ParallLossModule(BaseModule):
         >>> seq_mod.add(part_mod2, ctx2)
 
         """
-        assert False
         self._modules.append(module)
+        self._sub_module_contexts.append(context)
         
         # after adding new modules, we are reset back to raw states, needs
         # to bind, init_params, etc.
@@ -77,10 +103,8 @@ class ParallLossModule(BaseModule):
     @property
     def data_names(self):
         """A list of names for data required by this module."""
-        assert False
-        if len(self._modules) > 0:
-            return self._modules[0].data_names
-        return []
+        assert len(self._modules) > 0
+        return self._modules[0].data_names
 
     @property
     def output_names(self):
@@ -100,7 +124,6 @@ class ParallLossModule(BaseModule):
             A list of `(name, shape)` pairs. The data shapes of the first module
             is the data shape of a `SequentialModule`.
         """
-        assert False
         assert self.binded
         return self._modules[0].data_shapes
 
@@ -115,7 +138,6 @@ class ParallLossModule(BaseModule):
             the module does not need labels, or if the module is not bound for
             training (in this case, label information is not available).
         """
-        assert False
         assert self.binded
         return self._label_shapes
 
@@ -129,9 +151,9 @@ class ParallLossModule(BaseModule):
             A list of `(name, shape)` pairs. The output shapes of the last
             module is the output shape of a `SequentialModule`.
         """
-        assert False
         assert self.binded
-        return self._modules[-1].output_shapes
+        return [(name, (shape[0], shape[1] * len(self._modules)))
+                for name, shape in self._modules[0].output_shapes]
 
     def get_params(self):
         """Gets current parameters.
@@ -142,7 +164,6 @@ class ParallLossModule(BaseModule):
             A pair of dictionaries each mapping parameter names to NDArray values. This
             is a merged dictionary of all the parameters in the modules.
         """
-        assert False
         assert self.binded and self.params_initialized
 
         arg_params = dict()
@@ -178,15 +199,15 @@ class ParallLossModule(BaseModule):
             If this is True, no error will be thrown when arg_params or aux_params
             contain extra parameters that is not needed by the executor.
         """
-        assert False
         if self.params_initialized and not force_init:
             return
         assert self.binded, 'call bind before initializing the parameters'
 
         for module in self._modules:
-            module.init_params(initializer=initializer, arg_params=arg_params,
-                               aux_params=aux_params, allow_missing=allow_missing,
-                               force_init=force_init, allow_extra=allow_extra)
+            module.init_params(initializer=initializer, \
+                    arg_params=arg_params, aux_params=aux_params, \
+                    allow_missing=allow_missing, force_init=force_init,\
+                    allow_extra=allow_extra)
 
         # make sure we do not have duplicated parameter names
         def _check_name(known_names, new_names, modules, i):
@@ -208,8 +229,8 @@ class ParallLossModule(BaseModule):
         self.params_initialized = True
 
     def bind(self, data_shapes, label_shapes=None, for_training=True,
-             inputs_need_grad=False, force_rebind=False, shared_module=None,
-             grad_req='write'):
+             inputs_need_grad=False, force_rebind=False, 
+             shared_module=None, grad_req='write'):
         """Binds the symbols to construct executors. This is necessary before one
         can perform computation with the module.
 
@@ -235,13 +256,13 @@ class ParallLossModule(BaseModule):
             (default to 'write').
             Can be specified globally (str) or for each argument (list, dict).
         """
-        assert False
         if self.binded and not force_rebind:
             self.logger.warning('Already bound, ignoring bind()')
             return
 
         if inputs_need_grad:
             assert for_training is True
+        self.inputs_need_grad = inputs_need_grad
         assert shared_module is None, 'Shared module is not supported'
         assert len(self._modules) > 0, 'Attempting to bind an empty SequentialModule'
 
@@ -250,36 +271,27 @@ class ParallLossModule(BaseModule):
         # the same label shapes are used for all chained modules
         self._label_shapes = label_shapes
 
+
         my_data_shapes = data_shapes
-        anybody_ever_needs_label = False
-        for i_layer, module in enumerate(self._modules):
-            meta = self._metas[i_layer]
-            if SequentialModule.META_TAKE_LABELS in meta and \
-                    meta[SequentialModule.META_TAKE_LABELS]:
-                my_label_shapes = label_shapes
-                anybody_ever_needs_label = True
-            else:
-                my_label_shapes = None
+        my_label_shapes = label_shapes
+        self._pred_buf = []
+        for i, module in enumerate(self._modules):
+            my_inputs_need_grad = True if for_training else False 
 
-            my_inputs_need_grad = bool(inputs_need_grad or
-                                       (for_training and i_layer > 0))
+            module.bind(data_shapes=my_data_shapes, 
+                        label_shapes=my_label_shapes,
+                        for_training=for_training, 
+                        inputs_need_grad=my_inputs_need_grad,
+                        force_rebind=force_rebind,
+                        shared_module=None, grad_req=grad_req)
+            buff = mx.nd.zeros((self._batch_size, self._ctx_num_class),
+                        self._sub_module_contexts[i], dtype='float32')
+            buff.attach_grad()
+            self._pred_buf.append(buff)
+            
+        self._label_shapes = None
 
-            if meta.get(SequentialModule.META_AUTO_WIRING, False):
-                data_names = module.data_names
-                assert len(data_names) == len(my_data_shapes)
-                my_data_shapes = [(new_name, shape) for (new_name, (_, shape))
-                                  in zip(data_names, my_data_shapes)]
 
-            module.bind(data_shapes=my_data_shapes, label_shapes=my_label_shapes,
-                        for_training=for_training, inputs_need_grad=my_inputs_need_grad,
-                        force_rebind=force_rebind, shared_module=None, grad_req=grad_req)
-
-            # the output of the previous module is the data of the next module
-            my_data_shapes = module.output_shapes
-
-        if not anybody_ever_needs_label:
-            # then I do not need label either
-            self._label_shapes = None
 
     def init_optimizer(self, kvstore='local', optimizer='sgd',
                        optimizer_params=(('learning_rate', 0.01),),
@@ -299,7 +311,6 @@ class ParallLossModule(BaseModule):
             Default ``False``, indicating whether we should force re-initializing the
             optimizer in the case an optimizer is already installed.
         """
-        assert False
         assert self.binded and self.params_initialized
         if self.optimizer_initialized and not force_init:
             self.logger.warning('optimizer already initialized, ignoring.')
@@ -307,7 +318,8 @@ class ParallLossModule(BaseModule):
 
         for module in self._modules:
             module.init_optimizer(kvstore=kvstore, optimizer=optimizer,
-                                  optimizer_params=optimizer_params, force_init=force_init)
+                                  optimizer_params=optimizer_params, 
+                                  force_init=force_init)
 
         self.optimizer_initialized = True
 
@@ -320,46 +332,49 @@ class ParallLossModule(BaseModule):
         is_train : bool
             Default is ``None``, in which case `is_train` is take as ``self.for_training``.
         """
-        assert False
         assert self.binded and self.params_initialized
 
         # make a shallow copy, just to maintain necessary properties (if any) like
         # bucket_key, pad, etc.
         data_batch = copy.copy(data_batch)
 
-        for i_layer, module in enumerate(self._modules):
+        for i, module in enumerate(self._modules):
             module.forward(data_batch, is_train=is_train)
 
-            if i_layer+1 == len(self._modules):
-                # the last layer, do not need to do the followings
-                break
+            if is_train : 
+                self._pred_buf[i][:] = module.get_outputs()[0]
 
-            data_batch.data = module.get_outputs()
-            if hasattr(data_batch, 'provide_data'):
-                # need to update this, in case the internal module is using bucketing
-                # or whatever
-                data_names = [x[0] for x in module.output_shapes]
-                assert len(data_names) == len(data_batch.data)
-                data_batch.provide_data = [(name, x.shape) for name, x in
-                                           zip(data_names, data_batch.data)]
-
+        if is_train:
+            assert (len(data_batch.label) == 1)
+            labels = mx.nd.array(data_batch.label[0], ctx=self._context,
+                    dtype='float32') - self.local_class_start
+            #labels = mx.nd.split(
+            #        mx.nd.one_hot(mx.nd.array(data_batch.label[0], 
+            #            ctx=self._context, dtype='float32'), self._num_class),
+            #        num_outputs=len(self._modules), axis=1)
+            device_labels = []
+            for i, buf in enumerate(self._pred_buf):
+                device_labels.append(
+                        mx.nd.one_hot(labels.as_in_context(buf.context) - (i*self._ctx_num_class), 
+                                    self._ctx_num_class))
+            total_loss = parall_loss(self._pred_buf, device_labels, 
+                            self._context, self._batch_size)
+            assert not math.isnan(total_loss.asscalar())
+            total_loss.backward()
+            
     def backward(self, out_grads=None):
         """Backward computation."""
-        assert False
         assert self.binded and self.params_initialized
+        assert out_grads == None
+        assert len(self._modules) > 1
 
-        for i_layer, module in reversed(list(zip(range(len(self._modules)), self._modules))):
-            module.backward(out_grads=out_grads)
-            if i_layer == 0:
-                break
-
-            out_grads = module.get_input_grads()
+        for  i, module in enumerate(self._modules):
+            module.backward(out_grads=[self._pred_buf[i].grad])
 
     def update(self):
         """Updates parameters according to installed optimizer and the gradient computed
         in the previous forward-backward cycle.
         """
-        assert False
         assert self.binded and self.params_initialized and self.optimizer_initialized
 
         for module in self._modules:
@@ -383,9 +398,18 @@ class ParallLossModule(BaseModule):
             out2]``. Otherwise, it is like ``[[out1_dev1, out1_dev2], [out2_dev1,
             out2_dev2]]``. All the output elements are numpy arrays.
         """
-        assert False
+        assert False ## will have no change to get output of the class layer
         assert self.binded and self.params_initialized
-        return self._modules[-1].get_outputs(merge_multi_context=merge_multi_context)
+        pred_list = [m.get_outputs(merge_multi_context=merge_multi_context) 
+                        for m in self._modules]
+
+        num_outputs = len(pred_list[0])
+        result = []
+        for i in range(num_outputs):
+            out = [outputs[i] for outpus in pred_list]
+            tensor = mx.nd.concat(*[temp.as_in_context(self._context) for temp in self._pred_buf], dim=1)
+            result.append(tensor)
+        return result
 
     def get_input_grads(self, merge_multi_context=True):
         """Gets the gradients with respect to the inputs of the module.
@@ -405,10 +429,14 @@ class ParallLossModule(BaseModule):
             is like ``[[grad1_dev1, grad1_dev2], [grad2_dev1, grad2_dev2]]``. All the output
             elements are `NDArray`.
         """
-        assert False
 
         assert self.binded and self.params_initialized and self.inputs_need_grad
-        return self._modules[0].get_input_grads(merge_multi_context=merge_multi_context)
+        grad_list = [m.get_input_grads(merge_multi_context=merge_multi_context)
+                for m in self._modules]
+        mod_len = len(self._modules)
+        grad_len = len(grad_list[0])
+        return [mx.nd.add_n(*[grad_list[m][g].as_in_context(self._context) for m in range(mod_len)])
+                for g in range(grad_len)]
 
     def update_metric(self, eval_metric, labels, pre_sliced=False):
         """Evaluates and accumulates evaluation metric on outputs of the last forward computation.
@@ -419,17 +447,23 @@ class ParallLossModule(BaseModule):
         labels : list of NDArray
             Typically ``data_batch.label``.
         """
-        assert False
         assert self.binded and self.params_initialized
+       
+        def parall_argmax(datas, ctx):
+            sub_max = mx.nd.concat(*[mx.nd.max(data, axis=1, keepdims=True).as_in_context(self._context)
+                                        for data in datas])
+            sub_arg_max = mx.nd.concat(*[data.shape[1]* i + mx.nd.argmax(data, axis=1, keepdims=True).as_in_context(self._context)
+                                        for i, data in enumerate(datas)], dim=1)
+            part_arg_max = mx.nd.argmax(sub_max, axis=1)
+            return mx.nd.pick(sub_arg_max, part_arg_max)
 
-        for meta, module in zip(self._metas, self._modules):
-            if SequentialModule.META_TAKE_LABELS in meta and \
-                    meta[SequentialModule.META_TAKE_LABELS]:
-                module.update_metric(eval_metric, labels, pre_sliced)
+        preds = parall_argmax(self._pred_buf, self._context)
+        assert (len(labels) == 1)
+        eval_metric.update_dict({'label':mx.nd.array(labels[0])}, {'fc_logits':preds})
+        
 
     def install_monitor(self, mon):
         """Installs monitor on all executors."""
-        assert False
         assert self.binded
         for module in self._modules:
             module.install_monitor(mon)

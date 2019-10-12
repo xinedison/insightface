@@ -116,7 +116,7 @@ dataset.emore.val_targets = ['lfw', 'cfp_fp', 'agedb_30']
 dataset.train_1m = edict()
 dataset.train_1m.dataset = 'train_1m'
 dataset.train_1m.dataset_path = '/data4/face_datasets/faces_umd'
-dataset.train_1m.num_classes = 1000000
+dataset.train_1m.num_classes = 2000000
 dataset.train_1m.image_shape = (112,112,3)
 dataset.train_1m.val_targets = ['lfw', 'cfp_fp', 'agedb_30']
 
@@ -189,7 +189,7 @@ default.pretrained_epoch = 1
 default.dataset = 'emore'
 default.loss = 'arcface'
 default.frequent = 20
-default.verbose = 100
+default.verbose = 1000
 default.kvstore = 'device'
 
 default.end_epoch = 10000

@@ -14,19 +14,21 @@ import random
 import logging
 import numpy as np
 import functools
+import argparse
 
-from image_iter import FaceImageIter
 import mxnet as mx
 from mxnet import ndarray as nd
-import argparse
 import mxnet.optimizer as optimizer
+
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'common'))
 import flops_counter
-from config import config, default, generate_config
+
 sys.path.append(os.path.join(os.path.dirname(__file__), 'eval'))
 import verification
 
-from symbol_factory import get_symbol_embedding, get_symbol_arcface
+from config import config, default, generate_config
+from image_iter import FaceImageIter
+from face_symbol_factory import get_symbol_embedding, get_symbol_arcface
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train parall face network')
@@ -87,16 +89,16 @@ def get_data_iter(config, batch_size):
 
 def train_net(args):
     ## =================== parse context ==========================
-    ctx = []
+    ctx_list = []
     cvd = os.environ['CUDA_VISIBLE_DEVICES'].strip()
     if len(cvd)>0:
         for i in range(len(cvd.split(','))):
-            ctx.append(mx.gpu(i))
-    if len(ctx)==0:
-        ctx = [mx.cpu()]
+            ctx_list.append(mx.gpu(i))
+    if len(ctx_list)==0:
+        ctx_list = [mx.cpu()]
         print('use cpu')
     else:
-        print('gpu num:', len(ctx))
+        print('gpu num:', len(ctx_list))
 
 
     ## ==================== get model save prefix and log ============
@@ -118,7 +120,7 @@ def train_net(args):
     logger.addHandler(streamhandler)
 
     ## ================ parse batch size and class info ======================
-    args.ctx_num = len(ctx)
+    args.ctx_num = len(ctx_list)
     if args.per_batch_size==0:
         args.per_batch_size = 128
     args.batch_size = args.per_batch_size*args.ctx_num
@@ -138,6 +140,8 @@ def train_net(args):
 
     ## =============== get train info ============================
     image_size = config.image_shape[0:2]
+    config.per_batch_size = args.per_batch_size
+
     if len(args.pretrained) == 0: # train from scratch 
         esym = get_symbol_embedding(config)
         asym = functools.partial(get_symbol_arcface, config=config)
@@ -152,23 +156,30 @@ def train_net(args):
         print('Network FLOPs: %s'%_str)
         logging.info("Network FLOPs : %s" % _str)
 
-    if config.num_workers==1:
-        #from parall_loss_module import ParallLossModule
-        from parall_module_local_v1 import ParallModule
+    if config.num_workers == 1:
+        from parall_loss_module import ParallLossModule
+        default_ctx = ctx_list[-1]
+        model_parall_loss = ParallLossModule(
+                context=default_ctx, batch_size=args.batch_size, 
+                ctx_num_class=args.ctx_num_classes, 
+                local_class_start=args.local_class_start, logger=logger)
+
+        for i, ctx in enumerate(ctx_list):
+            args._ctxid = i
+            part_w_sym = asym(args)
+            part_weight_module = mx.mod.Module(part_w_sym, context=ctx)
+
+            model_parall_loss.add(part_weight_module, ctx)
+
     else: # distribute parall loop
         assert False
 
+    model = mx.mod.SequentialModule()
+    embedding_feat_mod = mx.mod.Module(esym, 
+                            context=ctx_list, label_names=None)
+    model.add(embedding_feat_mod)
+    model.add(model_parall_loss, auto_wiring=True, take_labels=True)
 
-    model = ParallModule(
-        context       = ctx,
-        symbol        = esym,
-        data_names    = ['data'],
-        label_names    = ['softmax_label'],
-        asymbol       = asym,
-        args = args,
-        logger=logger,
-    )
-    
 
     ## ============ get optimizer =====================================
     if config.net_name=='fresnet' or config.net_name=='fmobilefacenet':
@@ -189,10 +200,10 @@ def train_net(args):
             ver_name_list.append(name)
             print('ver', name)
 
-    def ver_test(nbatch):
+    def ver_test(nbatch, feat_model):
         results = []
         for i in range(len(ver_list)):
-            acc1, std1, acc2, std2, xnorm, embeddings_list = verification.test(ver_list[i], model, args.batch_size, 10, None, None)
+            acc1, std1, acc2, std2, xnorm, embeddings_list = verification.test(ver_list[i], feat_model, args.batch_size, 10, None, None)
             print('[%s][%d]XNorm: %f' % (ver_name_list[i], nbatch, xnorm))
             #print('[%s][%d]Accuracy: %1.5f+-%1.5f' % (ver_name_list[i], nbatch, acc1, std1))
             print('[%s][%d]Accuracy-Flip: %1.5f+-%1.5f' % (ver_name_list[i], nbatch, acc2, std2))
@@ -225,7 +236,7 @@ def train_net(args):
             logger.info('lr-batch-epoch: {}'.format(opt.lr,param.nbatch,param.epoch))
 
         if mbatch>=0 and mbatch%args.verbose==0:
-            acc_list = ver_test(mbatch)
+            acc_list = ver_test(mbatch, embedding_feat_mod)
             save_step[0]+=1
             msave = save_step[0]
             do_save = False
@@ -259,8 +270,8 @@ def train_net(args):
                 print('saving', msave)
                 logger.info('saving {}'.format(msave))
 
-                arg, aux = model.get_export_params()
-                all_layers = model.symbol.get_internals()
+                arg, aux = embedding_feat_mod.get_params()
+                all_layers = embedding_feat_mod.symbol.get_internals()
                 _sym = all_layers['fc1_output']
                 mx.model.save_checkpoint(prefix, msave, _sym, arg, aux)
             print('[%d]Accuracy-Highest: %1.5f'%(mbatch, highest_acc[-1]))
