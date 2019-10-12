@@ -274,7 +274,6 @@ class ParallLossModule(BaseModule):
 
         my_data_shapes = data_shapes
         my_label_shapes = label_shapes
-        self._pred_buf = []
         for i, module in enumerate(self._modules):
             my_inputs_need_grad = True if for_training else False 
 
@@ -284,11 +283,6 @@ class ParallLossModule(BaseModule):
                         inputs_need_grad=my_inputs_need_grad,
                         force_rebind=force_rebind,
                         shared_module=None, grad_req=grad_req)
-            buff = mx.nd.zeros((self._batch_size, self._ctx_num_class),
-                        self._sub_module_contexts[i], dtype='float32')
-            buff.attach_grad()
-            self._pred_buf.append(buff)
-            
         self._label_shapes = None
 
 
@@ -341,8 +335,10 @@ class ParallLossModule(BaseModule):
         for i, module in enumerate(self._modules):
             module.forward(data_batch, is_train=is_train)
 
-            if is_train : 
-                self._pred_buf[i][:] = module.get_outputs()[0]
+        for i, module in enumerate(self._modules):
+            assert len(module.get_outputs()) == 1
+            module.get_outputs()[0].attach_grad()
+
 
         if is_train:
             assert (len(data_batch.label) == 1)
@@ -353,11 +349,11 @@ class ParallLossModule(BaseModule):
             #            ctx=self._context, dtype='float32'), self._num_class),
             #        num_outputs=len(self._modules), axis=1)
             device_labels = []
-            for i, buf in enumerate(self._pred_buf):
+            for i, ctx in enumerate(self._sub_module_contexts):
                 device_labels.append(
-                        mx.nd.one_hot(labels.as_in_context(buf.context) - (i*self._ctx_num_class), 
+                        mx.nd.one_hot(labels.as_in_context(ctx) - (i*self._ctx_num_class), 
                                     self._ctx_num_class))
-            total_loss = parall_loss(self._pred_buf, device_labels, 
+            total_loss = parall_loss([mod.get_outputs()[0] for mod in self._modules], device_labels, 
                             self._context, self._batch_size)
             assert not math.isnan(total_loss.asscalar())
             total_loss.backward()
@@ -369,7 +365,7 @@ class ParallLossModule(BaseModule):
         assert len(self._modules) > 1
 
         for  i, module in enumerate(self._modules):
-            module.backward(out_grads=[self._pred_buf[i].grad])
+            module.backward(out_grads=[self._modules[i].get_outputs()[0].grad])
 
     def update(self):
         """Updates parameters according to installed optimizer and the gradient computed
@@ -407,7 +403,7 @@ class ParallLossModule(BaseModule):
         result = []
         for i in range(num_outputs):
             out = [outputs[i] for outpus in pred_list]
-            tensor = mx.nd.concat(*[temp.as_in_context(self._context) for temp in self._pred_buf], dim=1)
+            tensor = mx.nd.concat(*[temp.as_in_context(self._context) for temp in out], dim=1)
             result.append(tensor)
         return result
 
@@ -457,7 +453,7 @@ class ParallLossModule(BaseModule):
             part_arg_max = mx.nd.argmax(sub_max, axis=1)
             return mx.nd.pick(sub_arg_max, part_arg_max)
 
-        preds = parall_argmax(self._pred_buf, self._context)
+        preds = parall_argmax([mod.get_outputs()[0] for mod in self._modules], self._context)
         assert (len(labels) == 1)
         eval_metric.update_dict({'label':mx.nd.array(labels[0])}, {'fc_logits':preds})
         

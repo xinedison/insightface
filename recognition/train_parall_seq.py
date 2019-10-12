@@ -146,7 +146,7 @@ def train_net(args):
 
     args.local_class_start = 0
 
-    logger.info("Train model with argument: {}".format(args, config))
+    logger.info("Train model with argument: {} config: {}".format(args, config))
 
     train_dataiter, val_dataiter = get_data_iter(config, args.batch_size)
 
