@@ -47,7 +47,6 @@ class ParallModule(BaseModule):
         self._num_ctx = len(self._context)
         self._ctx_num_classes = args.ctx_num_classes
         self._nd_cache = {}
-        self._ctx_cpu = mx.cpu()
         self._ctx_single_gpu = self._context[-1]
         self._fixed_param_names = None
         self._backbone_module = Module(self._symbol, self._data_names, 
@@ -211,7 +210,7 @@ class ParallModule(BaseModule):
             self._kvinit[key] = 1
         self._distkv.push(key, value)
 
-    #get fc1 and partial fc7
+    #get backbone fc1 and partial fc7
     def forward(self, data_batch, is_train=None):
         assert self.binded and self.params_initialized
         self._backbone_module.forward(data_batch, is_train=is_train)
@@ -219,7 +218,7 @@ class ParallModule(BaseModule):
             self._iter+=1
             fc1, label = self._backbone_module.get_outputs(merge_multi_context=True)
             global_fc1 = fc1
-            self.global_label = label.as_in_context(self._ctx_cpu)
+            self.global_label = label.as_in_context(self._ctx_single_gpu)
 
             for i, _module in enumerate(self._arcface_modules):
                 _label = self.global_label - self._ctx_class_start[i]
@@ -249,14 +248,14 @@ class ParallModule(BaseModule):
         return v
 
     def parall_loss(self, datas, labels, ctx):
-        loss_list = [mx.nd.sum(data * label) 
+        loss_list = [-mx.nd.sum(mx.nd.log(data) * label) 
                         for data, label in zip(datas, labels)]
         total_loss = mx.nd.add_n(*[loss.copyto(ctx) for loss in loss_list])
         return total_loss
 
     def parall_argmax(self, datas, ctx):
         sub_max = mx.nd.concat(*[mx.nd.max(data, axis=1, keepdims=True).as_in_context(ctx)
-                                    for data in datas])
+                                    for data in datas], dim=1)
         sub_arg_max = mx.nd.concat(*[data.shape[1]* i + mx.nd.argmax(data, axis=1, keepdims=True).as_in_context(ctx)
                                     for i, data in enumerate(datas)], dim=1)
         part_arg_max = mx.nd.argmax(sub_max, axis=1)
@@ -265,33 +264,18 @@ class ParallModule(BaseModule):
     def backward(self, out_grads=None):
         #print('in backward')
         assert self.binded and self.params_initialized
-
-        ## ============= forward pass ===========
-        tmp_ctx = self._ctx_single_gpu
+        ## ============= forward classifier layer ===========
         fc7_outs = []
-        ctx_fc7_max = self.get_ndarray_by_shape(tmp_ctx, 'ctx_fc7_max', (self._batch_size, len(self._context)))
         for i, _module in enumerate(self._arcface_modules):
             _fc7 = _module.get_outputs(merge_multi_context=True)[0]
             fc7_outs.append(_fc7)
-            _fc7_max = nd.max(_fc7, axis=1).as_in_context(tmp_ctx)
-            ctx_fc7_max[:,i] = _fc7_max
 
-        local_fc7_max = self.get_ndarray_by_shape(tmp_ctx, 'local_fc7_max', (self._batch_size, 1))
-        nd.max(ctx_fc7_max, axis=1, keepdims=True, out=local_fc7_max)
-        global_fc7_max = local_fc7_max
-        local_fc7_sum = self.get_ndarray_by_shape(tmp_ctx, 'local_fc7_sum', (self._batch_size,1))
-        local_fc7_sum[:,:] = 0.0
-        for i, _module in enumerate(self._arcface_modules):
-            _max = self.get_ndarray_by_v_arr(fc7_outs[i].context, 'fc7_max', global_fc7_max)
-            fc7_outs[i] = nd.broadcast_sub(fc7_outs[i], _max)
-            fc7_outs[i] = nd.exp(fc7_outs[i])
-            _sum = nd.sum(fc7_outs[i], axis=1, keepdims=True).as_in_context(tmp_ctx)
-            local_fc7_sum += _sum
-        global_fc7_sum = local_fc7_sum
-
-        fc1_grad_ctx = self._ctx_single_gpu
-        local_fc1_grad = self.get_ndarray_by_shape(fc1_grad_ctx, 'local_fc1_grad', (self._batch_size,self._emb_size))
-        local_fc1_grad[:,:] = 0.0
+        ctx_max = map(lambda fc7_out: nd.max(fc7_out, axis=1, keepdims=True).as_in_context(self._ctx_single_gpu), fc7_outs)
+        local_fc7_max = nd.max(nd.concat(*ctx_max, dim=1), axis=1, keepdims=True)
+        fc7_exps = list(map(lambda fc7_out : nd.exp(fc7_out - local_fc7_max.as_in_context(fc7_out.context)), fc7_outs))
+        ctx_sum = map(lambda fc7_out: nd.sum(fc7_out, axis=1, keepdims=True).as_in_context(self._ctx_single_gpu), fc7_exps)
+        exp_sum = nd.sum(nd.concat(*ctx_sum, dim=1), axis=1, keepdims=True)
+        softmax_outs = list(map(lambda fc7_exp : nd.broadcast_div(fc7_exp, exp_sum.as_in_context(fc7_exp.context)), fc7_exps))
 
         onehot_device_labels = [nd.one_hot(
                                     (self.global_label).as_in_context(device) - self._ctx_class_start[i],
@@ -299,33 +283,26 @@ class ParallModule(BaseModule):
                                     on_value = 1.0, off_value = 0.0)
                                 for i, device in enumerate(self._context)]
 
-        fc7_outs = [nd.broadcast_div(fc7_out, global_fc7_sum.as_in_context(fc7_out.context)) for fc7_out in fc7_outs]
 
         ## ============= verbose train accuracy and loss ===========
         if self._iter % self._verbose == 0:
-            _ctx = self._ctx_cpu
-            _probs = []
-            for i, _module in enumerate(self._arcface_modules):
-                _prob = self.get_ndarray_by_v_arr(_ctx, '_fc7_prob_%d' % i, fc7_outs[i])
-                _probs.append(_prob)
-
-            fc7_pred = self.parall_argmax(_probs, _ctx)
             local_label = self.global_label - self._local_class_start
+
+            fc7_pred = self.parall_argmax(softmax_outs, self._ctx_single_gpu)
             _pred = nd.equal(fc7_pred, local_label).asnumpy()[0]
-            
-            loss = self.parall_loss(fc7_outs, onehot_device_labels,  _ctx).asscalar()
+
+            loss = self.parall_loss(softmax_outs, onehot_device_labels,  self._ctx_single_gpu).asscalar()
             assert not math.isnan(loss)
 
             self.logger.info('[Iter {}] train acc : {}, total loss : {}'.format(self._iter, np.mean(_pred), loss))
 
 
-
-        ## ============= backward with gradient ===========
+        ## ============= backward large weight classifier layer with gradient ===========
+        local_fc1_grad = self.get_ndarray_by_shape(self._ctx_single_gpu, 'local_fc1_grad', (self._batch_size,self._emb_size))
+        local_fc1_grad[:,:] = 0.0
         for i, _module in enumerate(self._arcface_modules):
-            fc7_outs[i] -= onehot_device_labels[i]
-            _module.backward(out_grads = [fc7_outs[i]])
-
-            ctx_fc1_grad = self.get_ndarray_by_v_arr(fc1_grad_ctx, 'ctx_fc1_grad_%d'%i, _module.get_input_grads()[0])
+            _module.backward(out_grads = [softmax_outs[i] - onehot_device_labels[i]])
+            ctx_fc1_grad = self.get_ndarray_by_v_arr(self._ctx_single_gpu, 'ctx_fc1_grad_%d'%i, _module.get_input_grads()[0])
             local_fc1_grad += ctx_fc1_grad
 
         ## ============= backward backbone ===============
@@ -465,7 +442,6 @@ class ParallModule(BaseModule):
             validation_metric = eval_metric
         if not isinstance(eval_metric, metric.EvalMetric):
             eval_metric = metric.create(eval_metric)
-        #epoch_eval_metric = copy.deepcopy(eval_metric)
 
         ################################################################################
         # training loop
@@ -486,19 +462,6 @@ class ParallModule(BaseModule):
                 self.update()
                 assert not isinstance(data_batch, list)
 
-                #if isinstance(data_batch, list):
-                #    #print('XXX')
-                #    self.update_metric(eval_metric,
-                #                       [db.label for db in data_batch],
-                #                       pre_sliced=True)
-                #else:
-                #    #print('before update metric')
-                #    self.update_metric(eval_metric, data_batch.label)
-                #labels = data_batch.label
-                #labels = [self.global_label]
-                #self.update_metric(eval_metric, labels)
-                #self.update_metric(epoch_eval_metric, labels)
-
                 try:
                     # pre fetch next batch
                     next_data_batch = next(data_iter)
@@ -508,9 +471,6 @@ class ParallModule(BaseModule):
 
                 if monitor is not None:
                     monitor.toc_print()
-
-                #if end_of_batch:
-                #    eval_name_vals = epoch_eval_metric.get_name_value()
 
                 if batch_end_callback is not None:
                     batch_end_params = BatchEndParam(epoch=epoch, nbatch=nbatch,
@@ -522,8 +482,6 @@ class ParallModule(BaseModule):
                 nbatch += 1
 
             # one epoch of training is finished
-            #for name, val in eval_name_vals:
-            #    self.logger.info('Epoch[%d] Train-%s=%f', epoch, name, val)
             toc = time.time()
             self.logger.info('Epoch[%d] Time cost=%.3f', epoch, (toc-tic))
 
