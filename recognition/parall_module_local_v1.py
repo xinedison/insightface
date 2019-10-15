@@ -37,9 +37,10 @@ class ParallModule(BaseModule):
         self._verbose = args.verbose
         self._emb_size = config.emb_size
         self._local_class_start = args.local_class_start
+        assert self._local_class_start == 0
         self._iter = 0
 
-        self._curr_module = None
+        self._backbone_module = None
 
         self._num_workers = config.num_workers
         self._num_ctx = len(self._context)
@@ -48,29 +49,28 @@ class ParallModule(BaseModule):
         self._ctx_cpu = mx.cpu()
         self._ctx_single_gpu = self._context[-1]
         self._fixed_param_names = None
-        self._curr_module = Module(self._symbol, self._data_names, self._label_names, logger=self.logger,
+        self._backbone_module = Module(self._symbol, self._data_names, self._label_names, logger=self.logger,
                         context=self._context, work_load_list=self._work_load_list,
                         fixed_param_names=self._fixed_param_names)
         self._arcface_modules = []
         self._ctx_class_start = []
         for i in range(len(self._context)):
-
-          args._ctxid = i
-          _module = Module(self._asymbol(args), self._data_names, self._label_names, logger=self.logger,
-                          context=self._context[i], work_load_list=self._work_load_list,
-                          fixed_param_names=self._fixed_param_names)
-          self._arcface_modules.append(_module)
-          _c = args.local_class_start + i*args.ctx_num_classes
-          self._ctx_class_start.append(_c)
+            args._ctxid = i
+            _module = Module(self._asymbol(args), self._data_names, self._label_names, logger=self.logger,
+                            context=self._context[i], work_load_list=self._work_load_list,
+                            fixed_param_names=self._fixed_param_names)
+            self._arcface_modules.append(_module)
+            _c = args.local_class_start + i*args.ctx_num_classes
+            self._ctx_class_start.append(_c)
         self._usekv = False
-        if self._usekv:
-          self._distkv = mx.kvstore.create('dist_sync')
-          self._kvinit = {}
 
+        if self._usekv:
+            self._distkv = mx.kvstore.create('dist_sync')
+            self._kvinit = {}
 
     def _reset_bind(self):
         self.binded = False
-        self._curr_module = None
+        self._backbone_module = None
 
     @property
     def data_names(self):
@@ -83,36 +83,36 @@ class ParallModule(BaseModule):
     @property
     def data_shapes(self):
         assert self.binded
-        return self._curr_module.data_shapes
+        return self._backbone_module.data_shapes
 
     @property
     def label_shapes(self):
         assert self.binded
-        return self._curr_module.label_shapes
+        return self._backbone_module.label_shapes
 
     @property
     def output_shapes(self):
         assert self.binded
-        return self._curr_module.output_shapes
+        return self._backbone_module.output_shapes
 
     def get_export_params(self):
         assert self.binded and self.params_initialized
-        _g, _x = self._curr_module.get_params()
+        _g, _x = self._backbone_module.get_params()
         g = _g.copy()
         x = _x.copy()
         return g, x
 
     def get_params(self):
         assert self.binded and self.params_initialized
-        _g, _x = self._curr_module.get_params()
+        _g, _x = self._backbone_module.get_params()
         g = _g.copy()
         x = _x.copy()
         for _module in self._arcface_modules:
-          _g, _x = _module.get_params()
-          ag = _g.copy()
-          ax = _x.copy()
-          g.update(ag)
-          x.update(ax)
+            _g, _x = _module.get_params()
+            ag = _g.copy()
+            ax = _x.copy()
+            g.update(ag)
+            x.update(ax)
         return g, x
 
     def set_params(self, arg_params, aux_params, allow_missing=False, force_init=True,
@@ -123,16 +123,16 @@ class ParallModule(BaseModule):
       #ax = {}
       rk = []
       for k in g:
-        v = g[k]
-        if k.startswith('fc7'):
-          p1 = k.find('_')
-          p2 = k.rfind('_')
-          _ctxid = int(k[p1+1:p2])
-          self._arcface_modules[_ctxid].set_params({k:v}, {})
-          rk.append(k)
+          v = g[k]
+          if k.startswith('fc7'):
+              p1 = k.find('_')
+              p2 = k.rfind('_')
+              _ctxid = int(k[p1+1:p2])
+              self._arcface_modules[_ctxid].set_params({k:v}, {})
+              rk.append(k)
       for k in rk:
-        del g[k]
-      self._curr_module.set_params(g, x)
+          del g[k]
+      self._backbone_module.set_params(g, x)
       #self._arcface_module.set_params(ag, ax)
 
 
@@ -142,15 +142,15 @@ class ParallModule(BaseModule):
             return
         assert self.binded, 'call bind before initializing the parameters'
         #TODO init the same weights with all work nodes
-        self._curr_module.init_params(initializer=initializer, arg_params=None,
+        self._backbone_module.init_params(initializer=initializer, arg_params=None,
                                       aux_params=None, allow_missing=allow_missing,
                                       force_init=force_init, allow_extra=allow_extra)
         for _module in self._arcface_modules:
-          #_initializer = initializer
-          _initializer = mx.init.Normal(0.01)
-          _module.init_params(initializer=_initializer, arg_params=None,
-                                        aux_params=None, allow_missing=allow_missing,
-                                        force_init=force_init, allow_extra=allow_extra)
+            #_initializer = initializer
+            _initializer = mx.init.Normal(0.01)
+            _module.init_params(initializer=_initializer, arg_params=None,
+                                          aux_params=None, allow_missing=allow_missing,
+                                          force_init=force_init, allow_extra=allow_extra)
         self.params_initialized = True
 
 
@@ -175,15 +175,15 @@ class ParallModule(BaseModule):
         self.for_training = for_training
         self.inputs_need_grad = inputs_need_grad
         self.binded = True
-        self._curr_module.bind(data_shapes, label_shapes, for_training, inputs_need_grad,
+        self._backbone_module.bind(data_shapes, label_shapes, for_training, inputs_need_grad,
                     force_rebind=False, shared_module=None)
         _data_shape = data_shapes[0][1]
         print('_data_shape', _data_shape, label_shapes)
         self.logger.info('_data_shape {}'.format( _data_shape, label_shapes))
 
         for _module in self._arcface_modules:
-          _module.bind([('data', (_data_shape[0]*self._num_workers, self._emb_size))], [('softmax_label', (_data_shape[0]*self._num_workers,))], for_training, True,
-                      force_rebind=False, shared_module=None)
+            _module.bind([('data', (_data_shape[0]*self._num_workers, self._emb_size))], [('softmax_label', (_data_shape[0]*self._num_workers,))], for_training, True,
+                        force_rebind=False, shared_module=None)
         if self.params_initialized:
             self.set_params(arg_params, aux_params)
 
@@ -194,64 +194,69 @@ class ParallModule(BaseModule):
             self.logger.warning('optimizer already initialized, ignoring.')
             return
 
-        self._curr_module.init_optimizer(kvstore, optimizer, optimizer_params,
+        self._backbone_module.init_optimizer(kvstore, optimizer, optimizer_params,
                                          force_init=force_init)
         for _module in self._arcface_modules:
-          _module.init_optimizer(kvstore, optimizer, optimizer_params,
+            _module.init_optimizer(kvstore, optimizer, optimizer_params,
                                            force_init=force_init)
         self.optimizer_initialized = True
 
     def kv_push(self, key, value):
-      #if value.context!=mx.cpu():
-      #  value = value.as_in_context(mx.cpu())
-      if not key in self._kvinit:
-        self._distkv.init(key, nd.zeros_like(value))
-        self._kvinit[key] = 1
-      self._distkv.push(key, value)
+        #if value.context!=mx.cpu():
+        #  value = value.as_in_context(mx.cpu())
+        if not key in self._kvinit:
+            self._distkv.init(key, nd.zeros_like(value))
+            self._kvinit[key] = 1
+        self._distkv.push(key, value)
 
     #get fc1 and partial fc7
     def forward(self, data_batch, is_train=None):
-        #g,x = self.get_params()
-        #print('{fc7_weight[0][0]}', self._iter, g['fc7_0_weight'].asnumpy()[0][0])
-        #print('{pre_fc1_weight[0][0]}', self._iter, g['pre_fc1_weight'].asnumpy()[0][0])
-
-
         assert self.binded and self.params_initialized
-        self._curr_module.forward(data_batch, is_train=is_train)
+        self._backbone_module.forward(data_batch, is_train=is_train)
         if is_train:
-          self._iter+=1
-          fc1, label = self._curr_module.get_outputs(merge_multi_context=True)
-          global_fc1 = fc1
-          self.global_label = label.as_in_context(self._ctx_cpu)
+            self._iter+=1
+            fc1, label = self._backbone_module.get_outputs(merge_multi_context=True)
+            global_fc1 = fc1
+            self.global_label = label.as_in_context(self._ctx_cpu)
 
 
-          for i, _module in enumerate(self._arcface_modules):
-            _label = self.global_label - self._ctx_class_start[i]
-            db_global_fc1 = io.DataBatch([global_fc1], [_label])
-            _module.forward(db_global_fc1) #fc7 with margin
+            for i, _module in enumerate(self._arcface_modules):
+                _label = self.global_label - self._ctx_class_start[i]
+                db_global_fc1 = io.DataBatch([global_fc1], [_label])
+                _module.forward(db_global_fc1) #fc7 with margin
         #print('forward end')
 
+    def get_ndarray_by_shape(self, context, name, shape):
+        key = "%s_%s"%(name, context)
+        #print(key)
+        if not key in self._nd_cache:
+            v = nd.zeros( shape=shape, ctx = context)
+            self._nd_cache[key] = v
+        else:
+            v = self._nd_cache[key]
+        return v
 
-    def get_ndarray(self, context, name, shape):
-      key = "%s_%s"%(name, context)
-      #print(key)
-      if not key in self._nd_cache:
-        v = nd.zeros( shape=shape, ctx = context)
-        self._nd_cache[key] = v
-      else:
-        v = self._nd_cache[key]
-      return v
+    def get_ndarray_by_v_arr(self, context, name, arr):
+        key = "%s_%s" % (name, context)
+        #print(key)
+        if not key in self._nd_cache:
+            v = nd.zeros( shape=arr.shape, ctx = context)
+            self._nd_cache[key] = v
+        else:
+            v = self._nd_cache[key]
+        arr.copyto(v)
+        return v
 
-    def get_ndarray2(self, context, name, arr):
-      key = "%s_%s" % (name, context)
-      #print(key)
-      if not key in self._nd_cache:
-        v = nd.zeros( shape=arr.shape, ctx = context)
-        self._nd_cache[key] = v
-      else:
-        v = self._nd_cache[key]
-      arr.copyto(v)
-      return v
+    def parall_loss(self, datas, labels, ctx):
+        pass
+
+    def parall_argmax(self, datas, ctx):
+        sub_max = mx.nd.concat(*[mx.nd.max(data, axis=1, keepdims=True).as_in_context(ctx)
+                                    for data in datas])
+        sub_arg_max = mx.nd.concat(*[data.shape[1]* i + mx.nd.argmax(data, axis=1, keepdims=True).as_in_context(ctx)
+                                    for i, data in enumerate(datas)], dim=1)
+        part_arg_max = mx.nd.argmax(sub_max, axis=1)
+        return mx.nd.pick(sub_arg_max, part_arg_max)
 
     def backward(self, out_grads=None):
         #print('in backward')
@@ -259,87 +264,149 @@ class ParallModule(BaseModule):
         #tmp_ctx = self._ctx_cpu
         tmp_ctx = self._ctx_single_gpu
         fc7_outs = []
-        ctx_fc7_max = self.get_ndarray(tmp_ctx, 'ctx_fc7_max', (self._batch_size, len(self._context)))
+        ctx_fc7_max = self.get_ndarray_by_shape(tmp_ctx, 'ctx_fc7_max', (self._batch_size, len(self._context)))
         #local_fc7_max = nd.zeros( (self.global_label.shape[0],1), ctx=mx.cpu())
         for i, _module in enumerate(self._arcface_modules):
-          _fc7 = _module.get_outputs(merge_multi_context=True)[0]
-          fc7_outs.append(_fc7)
-          _fc7_max = nd.max(_fc7, axis=1).as_in_context(tmp_ctx)
-          ctx_fc7_max[:,i] = _fc7_max
+            _fc7 = _module.get_outputs(merge_multi_context=True)[0]
+            fc7_outs.append(_fc7)
+            _fc7_max = nd.max(_fc7, axis=1).as_in_context(tmp_ctx)
+            ctx_fc7_max[:,i] = _fc7_max
 
-        local_fc7_max = self.get_ndarray(tmp_ctx, 'local_fc7_max', (self._batch_size, 1))
+        local_fc7_max = self.get_ndarray_by_shape(tmp_ctx, 'local_fc7_max', (self._batch_size, 1))
         nd.max(ctx_fc7_max, axis=1, keepdims=True, out=local_fc7_max)
         global_fc7_max = local_fc7_max
         #local_fc7_sum = None
-        local_fc7_sum = self.get_ndarray(tmp_ctx, 'local_fc7_sum', (self._batch_size,1))
+        local_fc7_sum = self.get_ndarray_by_shape(tmp_ctx, 'local_fc7_sum', (self._batch_size,1))
         local_fc7_sum[:,:] = 0.0
         for i, _module in enumerate(self._arcface_modules):
-          _max = self.get_ndarray2(fc7_outs[i].context, 'fc7_max', global_fc7_max)
-          fc7_outs[i] = nd.broadcast_sub(fc7_outs[i], _max)
-          fc7_outs[i] = nd.exp(fc7_outs[i])
-          _sum = nd.sum(fc7_outs[i], axis=1, keepdims=True).as_in_context(tmp_ctx)
-          local_fc7_sum += _sum
+            _max = self.get_ndarray_by_v_arr(fc7_outs[i].context, 'fc7_max', global_fc7_max)
+            fc7_outs[i] = nd.broadcast_sub(fc7_outs[i], _max)
+            fc7_outs[i] = nd.exp(fc7_outs[i])
+            _sum = nd.sum(fc7_outs[i], axis=1, keepdims=True).as_in_context(tmp_ctx)
+            local_fc7_sum += _sum
         global_fc7_sum = local_fc7_sum
 
         if self._iter % self._verbose == 0:
-          #_ctx = self._context[-1]
-          _ctx = self._ctx_cpu
-          _probs = []
-          for i, _module in enumerate(self._arcface_modules):
-            _prob = self.get_ndarray2(_ctx, '_fc7_prob_%d' % i, fc7_outs[i])
-            _probs.append(_prob)
-          fc7_prob = self.get_ndarray(_ctx, 'test_fc7_prob', (self._batch_size, self._ctx_num_classes*len(self._context)))
-          nd.concat(*_probs, dim=1, out=fc7_prob)
-          fc7_pred = nd.argmax(fc7_prob, axis=1)
-          local_label = self.global_label - self._local_class_start
-          #local_label = self.get_ndarray2(_ctx, 'test_label', local_label)
-          _pred = nd.equal(fc7_pred, local_label).asnumpy()[0]
-          print('{fc7_acc}', self._iter, np.mean(_pred))
-          self.logger.info('iter {} acc : {}'.format(self._iter, np.mean(_pred)))
+            #_ctx = self._context[-1]
+            _ctx = self._ctx_cpu
+            _probs = []
+            for i, _module in enumerate(self._arcface_modules):
+                _prob = self.get_ndarray_by_v_arr(_ctx, '_fc7_prob_%d' % i, fc7_outs[i])
+                _probs.append(_prob)
+            fc7_prob = self.get_ndarray_by_shape(_ctx, 'test_fc7_prob', (self._batch_size, self._ctx_num_classes*len(self._context)))
+            nd.concat(*_probs, dim=1, out=fc7_prob)
+            fc7_pred = nd.argmax(fc7_prob, axis=1)
+            local_label = self.global_label - self._local_class_start
+            #local_label = self.get_ndarray_by_v_arr(_ctx, 'test_label', local_label)
+            _pred = nd.equal(fc7_pred, local_label).asnumpy()[0]
+            print('{fc7_acc}', self._iter, np.mean(_pred))
+            self.logger.info('iter {} acc : {}'.format(self._iter, np.mean(_pred)))
 
 
 
         #local_fc1_grad = []
         #fc1_grad_ctx = self._ctx_cpu
         fc1_grad_ctx = self._ctx_single_gpu
-        local_fc1_grad = self.get_ndarray(fc1_grad_ctx, 'local_fc1_grad', (self._batch_size,self._emb_size))
+        local_fc1_grad = self.get_ndarray_by_shape(fc1_grad_ctx, 'local_fc1_grad', (self._batch_size,self._emb_size))
         local_fc1_grad[:,:] = 0.0
 
         for i, _module in enumerate(self._arcface_modules):
-          _sum = self.get_ndarray2(fc7_outs[i].context, 'fc7_sum', global_fc7_sum)
-          fc7_outs[i] = nd.broadcast_div(fc7_outs[i], _sum)
-          a = i*self._ctx_num_classes
-          b = (i+1)*self._ctx_num_classes
-          _label = self.global_label - self._ctx_class_start[i]
-          _label = self.get_ndarray2(fc7_outs[i].context, 'label', _label)
-          onehot_label = self.get_ndarray(fc7_outs[i].context, 'label_onehot', (self._batch_size, self._ctx_num_classes))
-          nd.one_hot(_label, depth=self._ctx_num_classes, on_value = 1.0, off_value = 0.0, out=onehot_label)
-          fc7_outs[i] -= onehot_label
-          _module.backward(out_grads = [fc7_outs[i]])
-          #ctx_fc1_grad = _module.get_input_grads()[0].as_in_context(mx.cpu())
-          ctx_fc1_grad = self.get_ndarray2(fc1_grad_ctx, 'ctx_fc1_grad_%d'%i, _module.get_input_grads()[0])
-          local_fc1_grad += ctx_fc1_grad
+            _sum = self.get_ndarray_by_v_arr(fc7_outs[i].context, 'fc7_sum', global_fc7_sum)
+            fc7_outs[i] = nd.broadcast_div(fc7_outs[i], _sum)
+            a = i*self._ctx_num_classes
+            b = (i+1)*self._ctx_num_classes
+            _label = self.global_label - self._ctx_class_start[i]
+            _label = self.get_ndarray_by_v_arr(fc7_outs[i].context, 'label', _label)
+            onehot_label = self.get_ndarray_by_shape(fc7_outs[i].context, 'label_onehot', (self._batch_size, self._ctx_num_classes))
+            nd.one_hot(_label, depth=self._ctx_num_classes, on_value = 1.0, off_value = 0.0, out=onehot_label)
+            fc7_outs[i] -= onehot_label
+            _module.backward(out_grads = [fc7_outs[i]])
+            #ctx_fc1_grad = _module.get_input_grads()[0].as_in_context(mx.cpu())
+            ctx_fc1_grad = self.get_ndarray_by_v_arr(fc1_grad_ctx, 'ctx_fc1_grad_%d'%i, _module.get_input_grads()[0])
+            local_fc1_grad += ctx_fc1_grad
 
         global_fc1_grad = local_fc1_grad
-        self._curr_module.backward(out_grads = [global_fc1_grad])
+        self._backbone_module.backward(out_grads = [global_fc1_grad])
+
+    #def backward(self, out_grads=None):
+    #    #print('in backward')
+    #    assert self.binded and self.params_initialized
+
+    #    tmp_ctx = self._ctx_single_gpu
+    #    fc7_outs = []
+    #    ctx_fc7_max = self.get_ndarray_by_shape(tmp_ctx, 'ctx_fc7_max', (self._batch_size, len(self._context)))
+    #    for i, _module in enumerate(self._arcface_modules):
+    #        _fc7 = _module.get_outputs(merge_multi_context=True)[0]
+    #        fc7_outs.append(_fc7)
+    #        _fc7_max = nd.max(_fc7, axis=1).as_in_context(tmp_ctx)
+    #        ctx_fc7_max[:,i] = _fc7_max
+
+    #    local_fc7_max = self.get_ndarray_by_shape(tmp_ctx, 'local_fc7_max', (self._batch_size, 1))
+    #    nd.max(ctx_fc7_max, axis=1, keepdims=True, out=local_fc7_max)
+    #    global_fc7_max = local_fc7_max
+    #    local_fc7_sum = self.get_ndarray_by_shape(tmp_ctx, 'local_fc7_sum', (self._batch_size,1))
+    #    local_fc7_sum[:,:] = 0.0
+    #    for i, _module in enumerate(self._arcface_modules):
+    #        _max = self.get_ndarray_by_v_arr(fc7_outs[i].context, 'fc7_max', global_fc7_max)
+    #        fc7_outs[i] = nd.broadcast_sub(fc7_outs[i], _max)
+    #        fc7_outs[i] = nd.exp(fc7_outs[i])
+    #        _sum = nd.sum(fc7_outs[i], axis=1, keepdims=True).as_in_context(tmp_ctx)
+    #        local_fc7_sum += _sum
+    #    global_fc7_sum = local_fc7_sum
+
+    #    device_labels = [nd.one_hot(
+    #                        self.global_label-self._ctx_class_start[i], 
+    #                        depth=self._ctx_num_classes, on_value = 1.0, off_value = 0.0, 
+    #                        out=self.get_ndarray_by_shape(fc7_out.context, 'label_onehot', (self._batch_size, self._ctx_num_classes)))
+    #                        for i, fc7_out in enumerate(fc7_outs)]
+
+    #    if self._iter % self._verbose == 0:
+    #        #_ctx = self._context[-1]
+    #        _ctx = self._ctx_cpu
+    #        _probs = []
+    #        for i, _module in enumerate(self._arcface_modules):
+    #            _prob = self.get_ndarray_by_v_arr(_ctx, '_fc7_prob_%d' % i, _modules.get_outputs()[0])#fc7_outs[i])
+    #            _probs.append(_prob)
+    #        fc7_pred = self.parall_argmax(_probs, _ctx)
+    #        local_label = (self.global_label - self._local_class_start).asnumpy()
+    #        #local_label = self.get_ndarray_by_v_arr(_ctx, 'test_label', local_label)
+    #        print('fc7_pred', fc7_pred)
+    #        print('local label', local_label)
+    #        #_pred_true = nd.equal(fc7_pred, local_label).asnumpy()[0]
+    #        #print('{fc7_acc}', self._iter, np.mean(_pred_true))
+    #        #self.logger.info('iter : {} train acc : {}'.format(self._iter, np.mean(_pred_true)))
+
+    #    ## ============= compute backward gradient ======================
+    #    fc7_outs = [nd.broadcast_div(fc7_out, global_fc7_sum.copyto(fc7_out.context)) for fc7_out in fc7_outs]
+    #    fc7_outs = [(fc7_out - onehot_label) for fc7_out,onehot_label in zip(fc7_outs, device_labels)] 
+
+    #    local_fc1_grad = self.get_ndarray_by_shape(self._ctx_single_gpu, 'local_fc1_grad', (self._batch_size,self._emb_size))
+    #    local_fc1_grad[:,:] = 0.0
+    #    for i, _module in enumerate(self._arcface_modules):
+    #        _module.backward(out_grads = [fc7_outs[i]])
+    #        ctx_fc1_grad = self.get_ndarray_by_v_arr(self._ctx_single_gpu, 'ctx_fc1_grad_%d'%i, _module.get_input_grads()[0])
+    #        local_fc1_grad += ctx_fc1_grad
+
+    #    global_fc1_grad = local_fc1_grad
+    #    self._backbone_module.backward(out_grads = [global_fc1_grad])
 
 
     def update(self):
         assert self.binded and self.params_initialized and self.optimizer_initialized
-        self._curr_module.update()
+        self._backbone_module.update()
         for i, _module in enumerate(self._arcface_modules):
-          _module.update()
+            _module.update()
         mx.nd.waitall()
 
 
     def get_outputs(self, merge_multi_context=True):
         assert self.binded and self.params_initialized
-        return self._curr_module.get_outputs(merge_multi_context=merge_multi_context)
+        return self._backbone_module.get_outputs(merge_multi_context=merge_multi_context)
         #return self._arcface_module.get_outputs(merge_multi_context=merge_multi_context)
 
     def get_input_grads(self, merge_multi_context=True):
         assert self.binded and self.params_initialized and self.inputs_need_grad
-        return self._curr_module.get_input_grads(merge_multi_context=merge_multi_context)
+        return self._backbone_module.get_input_grads(merge_multi_context=merge_multi_context)
 
     def update_metric(self, eval_metric, labels):
         assert self.binded and self.params_initialized
@@ -348,7 +415,7 @@ class ParallModule(BaseModule):
     def install_monitor(self, mon):
         """ Install monitor on all executors """
         assert self.binded
-        self._curr_module.install_monitor(mon)
+        self._backbone_module.install_monitor(mon)
 
     def forward_backward(self, data_batch):
         """A convenient function that calls both ``forward`` and ``backward``."""

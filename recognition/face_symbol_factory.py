@@ -10,7 +10,12 @@ import fdensenet
 
 def get_symbol_embedding(config):
     embedding = eval(config.net_name).get_symbol()
-    return embedding
+    all_label = mx.symbol.Variable('softmax_label')
+    #embedding = mx.symbol.BlockGrad(embedding)
+    all_label = mx.symbol.BlockGrad(all_label)
+    out_list = [embedding, all_label]
+    out = mx.symbol.Group(out_list)
+    return out
 
 def get_symbol_arcface(args, config):
     embedding = mx.symbol.Variable('data')
