@@ -7,9 +7,10 @@ import logging
 import copy
 import time
 import os
+import numpy as np
+import math
 
 import mxnet as mx
-import numpy as np
 from mxnet import context as ctx
 from mxnet.initializer import Uniform
 from mxnet.module.base_module import BaseModule
@@ -49,7 +50,8 @@ class ParallModule(BaseModule):
         self._ctx_cpu = mx.cpu()
         self._ctx_single_gpu = self._context[-1]
         self._fixed_param_names = None
-        self._backbone_module = Module(self._symbol, self._data_names, self._label_names, logger=self.logger,
+        self._backbone_module = Module(self._symbol, self._data_names, 
+                        self._label_names, logger=self.logger,
                         context=self._context, work_load_list=self._work_load_list,
                         fixed_param_names=self._fixed_param_names)
         self._arcface_modules = []
@@ -219,7 +221,6 @@ class ParallModule(BaseModule):
             global_fc1 = fc1
             self.global_label = label.as_in_context(self._ctx_cpu)
 
-
             for i, _module in enumerate(self._arcface_modules):
                 _label = self.global_label - self._ctx_class_start[i]
                 db_global_fc1 = io.DataBatch([global_fc1], [_label])
@@ -248,7 +249,10 @@ class ParallModule(BaseModule):
         return v
 
     def parall_loss(self, datas, labels, ctx):
-        pass
+        loss_list = [mx.nd.sum(data * label) 
+                        for data, label in zip(datas, labels)]
+        total_loss = mx.nd.add_n(*[loss.copyto(ctx) for loss in loss_list])
+        return total_loss
 
     def parall_argmax(self, datas, ctx):
         sub_max = mx.nd.concat(*[mx.nd.max(data, axis=1, keepdims=True).as_in_context(ctx)
@@ -261,11 +265,11 @@ class ParallModule(BaseModule):
     def backward(self, out_grads=None):
         #print('in backward')
         assert self.binded and self.params_initialized
-        #tmp_ctx = self._ctx_cpu
+
+        ## ============= forward pass ===========
         tmp_ctx = self._ctx_single_gpu
         fc7_outs = []
         ctx_fc7_max = self.get_ndarray_by_shape(tmp_ctx, 'ctx_fc7_max', (self._batch_size, len(self._context)))
-        #local_fc7_max = nd.zeros( (self.global_label.shape[0],1), ctx=mx.cpu())
         for i, _module in enumerate(self._arcface_modules):
             _fc7 = _module.get_outputs(merge_multi_context=True)[0]
             fc7_outs.append(_fc7)
@@ -275,7 +279,6 @@ class ParallModule(BaseModule):
         local_fc7_max = self.get_ndarray_by_shape(tmp_ctx, 'local_fc7_max', (self._batch_size, 1))
         nd.max(ctx_fc7_max, axis=1, keepdims=True, out=local_fc7_max)
         global_fc7_max = local_fc7_max
-        #local_fc7_sum = None
         local_fc7_sum = self.get_ndarray_by_shape(tmp_ctx, 'local_fc7_sum', (self._batch_size,1))
         local_fc7_sum[:,:] = 0.0
         for i, _module in enumerate(self._arcface_modules):
@@ -286,110 +289,48 @@ class ParallModule(BaseModule):
             local_fc7_sum += _sum
         global_fc7_sum = local_fc7_sum
 
+        fc1_grad_ctx = self._ctx_single_gpu
+        local_fc1_grad = self.get_ndarray_by_shape(fc1_grad_ctx, 'local_fc1_grad', (self._batch_size,self._emb_size))
+        local_fc1_grad[:,:] = 0.0
+
+        onehot_device_labels = [nd.one_hot(
+                                    (self.global_label).as_in_context(device) - self._ctx_class_start[i],
+                                    depth=self._ctx_num_classes, 
+                                    on_value = 1.0, off_value = 0.0)
+                                for i, device in enumerate(self._context)]
+
+        fc7_outs = [nd.broadcast_div(fc7_out, global_fc7_sum.as_in_context(fc7_out.context)) for fc7_out in fc7_outs]
+
+        ## ============= verbose train accuracy and loss ===========
         if self._iter % self._verbose == 0:
-            #_ctx = self._context[-1]
             _ctx = self._ctx_cpu
             _probs = []
             for i, _module in enumerate(self._arcface_modules):
                 _prob = self.get_ndarray_by_v_arr(_ctx, '_fc7_prob_%d' % i, fc7_outs[i])
                 _probs.append(_prob)
-            fc7_prob = self.get_ndarray_by_shape(_ctx, 'test_fc7_prob', (self._batch_size, self._ctx_num_classes*len(self._context)))
-            nd.concat(*_probs, dim=1, out=fc7_prob)
-            fc7_pred = nd.argmax(fc7_prob, axis=1)
+
+            fc7_pred = self.parall_argmax(_probs, _ctx)
             local_label = self.global_label - self._local_class_start
-            #local_label = self.get_ndarray_by_v_arr(_ctx, 'test_label', local_label)
             _pred = nd.equal(fc7_pred, local_label).asnumpy()[0]
-            print('{fc7_acc}', self._iter, np.mean(_pred))
-            self.logger.info('iter {} acc : {}'.format(self._iter, np.mean(_pred)))
+            
+            loss = self.parall_loss(fc7_outs, onehot_device_labels,  _ctx).asscalar()
+            assert not math.isnan(loss)
+
+            self.logger.info('[Iter {}] train acc : {}, total loss : {}'.format(self._iter, np.mean(_pred), loss))
 
 
 
-        #local_fc1_grad = []
-        #fc1_grad_ctx = self._ctx_cpu
-        fc1_grad_ctx = self._ctx_single_gpu
-        local_fc1_grad = self.get_ndarray_by_shape(fc1_grad_ctx, 'local_fc1_grad', (self._batch_size,self._emb_size))
-        local_fc1_grad[:,:] = 0.0
-
+        ## ============= backward with gradient ===========
         for i, _module in enumerate(self._arcface_modules):
-            _sum = self.get_ndarray_by_v_arr(fc7_outs[i].context, 'fc7_sum', global_fc7_sum)
-            fc7_outs[i] = nd.broadcast_div(fc7_outs[i], _sum)
-            a = i*self._ctx_num_classes
-            b = (i+1)*self._ctx_num_classes
-            _label = self.global_label - self._ctx_class_start[i]
-            _label = self.get_ndarray_by_v_arr(fc7_outs[i].context, 'label', _label)
-            onehot_label = self.get_ndarray_by_shape(fc7_outs[i].context, 'label_onehot', (self._batch_size, self._ctx_num_classes))
-            nd.one_hot(_label, depth=self._ctx_num_classes, on_value = 1.0, off_value = 0.0, out=onehot_label)
-            fc7_outs[i] -= onehot_label
+            fc7_outs[i] -= onehot_device_labels[i]
             _module.backward(out_grads = [fc7_outs[i]])
-            #ctx_fc1_grad = _module.get_input_grads()[0].as_in_context(mx.cpu())
+
             ctx_fc1_grad = self.get_ndarray_by_v_arr(fc1_grad_ctx, 'ctx_fc1_grad_%d'%i, _module.get_input_grads()[0])
             local_fc1_grad += ctx_fc1_grad
 
+        ## ============= backward backbone ===============
         global_fc1_grad = local_fc1_grad
         self._backbone_module.backward(out_grads = [global_fc1_grad])
-
-    #def backward(self, out_grads=None):
-    #    #print('in backward')
-    #    assert self.binded and self.params_initialized
-
-    #    tmp_ctx = self._ctx_single_gpu
-    #    fc7_outs = []
-    #    ctx_fc7_max = self.get_ndarray_by_shape(tmp_ctx, 'ctx_fc7_max', (self._batch_size, len(self._context)))
-    #    for i, _module in enumerate(self._arcface_modules):
-    #        _fc7 = _module.get_outputs(merge_multi_context=True)[0]
-    #        fc7_outs.append(_fc7)
-    #        _fc7_max = nd.max(_fc7, axis=1).as_in_context(tmp_ctx)
-    #        ctx_fc7_max[:,i] = _fc7_max
-
-    #    local_fc7_max = self.get_ndarray_by_shape(tmp_ctx, 'local_fc7_max', (self._batch_size, 1))
-    #    nd.max(ctx_fc7_max, axis=1, keepdims=True, out=local_fc7_max)
-    #    global_fc7_max = local_fc7_max
-    #    local_fc7_sum = self.get_ndarray_by_shape(tmp_ctx, 'local_fc7_sum', (self._batch_size,1))
-    #    local_fc7_sum[:,:] = 0.0
-    #    for i, _module in enumerate(self._arcface_modules):
-    #        _max = self.get_ndarray_by_v_arr(fc7_outs[i].context, 'fc7_max', global_fc7_max)
-    #        fc7_outs[i] = nd.broadcast_sub(fc7_outs[i], _max)
-    #        fc7_outs[i] = nd.exp(fc7_outs[i])
-    #        _sum = nd.sum(fc7_outs[i], axis=1, keepdims=True).as_in_context(tmp_ctx)
-    #        local_fc7_sum += _sum
-    #    global_fc7_sum = local_fc7_sum
-
-    #    device_labels = [nd.one_hot(
-    #                        self.global_label-self._ctx_class_start[i], 
-    #                        depth=self._ctx_num_classes, on_value = 1.0, off_value = 0.0, 
-    #                        out=self.get_ndarray_by_shape(fc7_out.context, 'label_onehot', (self._batch_size, self._ctx_num_classes)))
-    #                        for i, fc7_out in enumerate(fc7_outs)]
-
-    #    if self._iter % self._verbose == 0:
-    #        #_ctx = self._context[-1]
-    #        _ctx = self._ctx_cpu
-    #        _probs = []
-    #        for i, _module in enumerate(self._arcface_modules):
-    #            _prob = self.get_ndarray_by_v_arr(_ctx, '_fc7_prob_%d' % i, _modules.get_outputs()[0])#fc7_outs[i])
-    #            _probs.append(_prob)
-    #        fc7_pred = self.parall_argmax(_probs, _ctx)
-    #        local_label = (self.global_label - self._local_class_start).asnumpy()
-    #        #local_label = self.get_ndarray_by_v_arr(_ctx, 'test_label', local_label)
-    #        print('fc7_pred', fc7_pred)
-    #        print('local label', local_label)
-    #        #_pred_true = nd.equal(fc7_pred, local_label).asnumpy()[0]
-    #        #print('{fc7_acc}', self._iter, np.mean(_pred_true))
-    #        #self.logger.info('iter : {} train acc : {}'.format(self._iter, np.mean(_pred_true)))
-
-    #    ## ============= compute backward gradient ======================
-    #    fc7_outs = [nd.broadcast_div(fc7_out, global_fc7_sum.copyto(fc7_out.context)) for fc7_out in fc7_outs]
-    #    fc7_outs = [(fc7_out - onehot_label) for fc7_out,onehot_label in zip(fc7_outs, device_labels)] 
-
-    #    local_fc1_grad = self.get_ndarray_by_shape(self._ctx_single_gpu, 'local_fc1_grad', (self._batch_size,self._emb_size))
-    #    local_fc1_grad[:,:] = 0.0
-    #    for i, _module in enumerate(self._arcface_modules):
-    #        _module.backward(out_grads = [fc7_outs[i]])
-    #        ctx_fc1_grad = self.get_ndarray_by_v_arr(self._ctx_single_gpu, 'ctx_fc1_grad_%d'%i, _module.get_input_grads()[0])
-    #        local_fc1_grad += ctx_fc1_grad
-
-    #    global_fc1_grad = local_fc1_grad
-    #    self._backbone_module.backward(out_grads = [global_fc1_grad])
-
 
     def update(self):
         assert self.binded and self.params_initialized and self.optimizer_initialized
